@@ -1,15 +1,17 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import sqlite3
-import random
 import os
+import json
+import random
 from dotenv import load_dotenv
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyClientCredentials
-load_dotenv()  # завантажити .env файл
+from allowed_artists import ALLOWED_ARTISTS
+from voice_message_handler import get_audio_preview
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+load_dotenv("keys.env")
+
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
@@ -20,137 +22,121 @@ spotify = Spotify(auth_manager=SpotifyClientCredentials(
 
 app = FastAPI()
 
-# CORS для Telegram WebApp
+# Дозволяємо CORS для Telegram WebApp
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-DB_FILE = "music_app.db"
+artist_weights = {artist_id: 1 for artist_id in ALLOWED_ARTISTS.keys()}
+user_shown_tracks = {}
+user_subscriptions = {}
 
-def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute('''CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            username TEXT
-        )''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS subscriptions (
-            user_id INTEGER,
-            artist_id TEXT,
-            PRIMARY KEY (user_id, artist_id)
-        )''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS artist_descriptions (
-            artist_name TEXT PRIMARY KEY,
-            description TEXT
-        )''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS shown_tracks (
-            user_id INTEGER,
-            track_id TEXT,
-            PRIMARY KEY (user_id, track_id)
-        )''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS allowed_artists (
-            id TEXT PRIMARY KEY,
-            name TEXT
-        )''')
-        conn.commit()
+SUBSCRIPTIONS_FILE = "subscriptions.json"
+FEEDBACK_FILE = "feedback.txt"
 
-init_db()
+if os.path.exists(SUBSCRIPTIONS_FILE):
+    with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
+        user_subscriptions = json.load(f)
 
-# Тестові дані
-TEST_ARTISTS = {
-    "1": "alyona alyona",
-    "2": "Kalush",
-    "3": "Skofka"
-}
 
-with sqlite3.connect(DB_FILE) as conn:
-    for artist_id, name in TEST_ARTISTS.items():
-        conn.execute("INSERT OR IGNORE INTO allowed_artists (id, name) VALUES (?, ?)", (artist_id, name))
-    conn.commit()
+@app.get("/recommendation")
+def get_recommendation(user_id: str, only_subscribed: bool = False):
+    if only_subscribed:
+        artist_ids = user_subscriptions.get(user_id, [])
+    else:
+        artist_ids = list(ALLOWED_ARTISTS.keys())
 
-# Моделі
-class UserRegister(BaseModel):
-    user_id: int
-    username: str
+    if user_id not in user_shown_tracks:
+        user_shown_tracks[user_id] = set()
 
-class Feedback(BaseModel):
-    user_id: int
-    message: str
+    weighted = random.choices(
+        artist_ids,
+        weights=[artist_weights.get(aid, 1) for aid in artist_ids],
+        k=len(artist_ids)
+    )
 
-class Reaction(BaseModel):
-    user_id: int
+    for artist_id in weighted:
+        albums = spotify.artist_albums(artist_id, album_type='album,single', country='UA', limit=50)
+        seen = set()
+        tracks = []
+
+        for album in albums['items']:
+            for track in spotify.album_tracks(album['id'])['items']:
+                if track['id'] not in seen and track['id'] not in user_shown_tracks[user_id]:
+                    seen.add(track['id'])
+                    tracks.append(track)
+
+        if tracks:
+            track = random.choice(tracks)
+            user_shown_tracks[user_id].add(track['id'])
+
+            return {
+                "id": track['id'],
+                "name": track['name'],
+                "artist": ALLOWED_ARTISTS[artist_id],
+                "artist_id": artist_id,
+                "url": track['external_urls']['spotify'],
+                "preview_url": track.get('preview_url'),
+                "album_cover": spotify.album(track['album']['id'])['images'][0]['url']
+                    if track.get('album') and track['album'].get('id') else None
+            }
+
+    return {"message": "No more tracks found."}
+
+
+class ReactionData(BaseModel):
+    user_id: str
+    artist_id: str
+    reaction: str  # like or dislike
+
+@app.post("/react")
+def react(data: ReactionData):
+    if data.reaction == "like":
+        artist_weights[data.artist_id] = artist_weights.get(data.artist_id, 1) + 2
+        return {"message": "Liked"}
+    elif data.reaction == "dislike":
+        artist_weights[data.artist_id] = max(1, artist_weights.get(data.artist_id, 1) - 3)
+        return {"message": "Disliked"}
+    else:
+        return {"error": "Unknown reaction type."}
+
+
+class SubscribeData(BaseModel):
+    user_id: str
     artist_id: str
 
-# API endpoints
-@app.post("/register")
-def register(user: UserRegister):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (user.user_id, user.username))
-    return {"status": "registered"}
-
-@app.get("/get-track")
-def get_random_track(user_id: int, only_subscribed: bool = False):
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        if only_subscribed:
-            cur.execute("SELECT artist_id FROM subscriptions WHERE user_id=?", (user_id,))
-        else:
-            cur.execute("SELECT id FROM allowed_artists")
-        artist_ids = [row[0] for row in cur.fetchall()]
-        if not artist_ids:
-            return {"error": "no_artists"}
-
-        selected_artist_id = random.choice(artist_ids)
-        cur.execute("SELECT name FROM allowed_artists WHERE id=?", (selected_artist_id,))
-        artist_name = cur.fetchone()[0]
-
-        fake_track = {
-            "track_id": f"track_{random.randint(100,999)}",
-            "track_name": f"Demo Track {random.randint(1, 99)}",
-            "artist_id": selected_artist_id,
-            "artist_name": artist_name,
-            "preview_url": None,
-            "album_cover": None
-        }
-
-        try:
-            conn.execute("INSERT INTO shown_tracks (user_id, track_id) VALUES (?, ?)", (user_id, fake_track["track_id"]))
-        except:
-            pass
-
-        cur.execute("SELECT description FROM artist_descriptions WHERE artist_name=?", (artist_name,))
-        row = cur.fetchone()
-        fake_track["artist_description"] = row[0] if row else "Опису виконавця немає."
-
-        return fake_track
-
-@app.post("/like")
-def like_track(reaction: Reaction):
-    return {"status": "liked", "artist_id": reaction.artist_id}
-
-@app.post("/dislike")
-def dislike_track(reaction: Reaction):
-    return {"status": "disliked", "artist_id": reaction.artist_id}
-
 @app.post("/subscribe")
-def subscribe_to_artist(reaction: Reaction):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("INSERT OR IGNORE INTO subscriptions (user_id, artist_id) VALUES (?, ?)", (reaction.user_id, reaction.artist_id))
-    return {"status": "subscribed"}
+def subscribe(data: SubscribeData):
+    if data.user_id not in user_subscriptions:
+        user_subscriptions[data.user_id] = []
+
+    if data.artist_id not in user_subscriptions[data.user_id]:
+        user_subscriptions[data.user_id].append(data.artist_id)
+
+        with open(SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(user_subscriptions, f, ensure_ascii=False, indent=2)
+
+    return {"message": "Subscribed"}
+
 
 @app.get("/subscriptions")
-def get_subscriptions(user_id: int):
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT artist_id FROM subscriptions WHERE user_id=?", (user_id,))
-        ids = [row[0] for row in cur.fetchall()]
-        return {"subscriptions": ids}
+def get_subscriptions(user_id: str):
+    return {
+        "subscriptions": user_subscriptions.get(user_id, [])
+    }
+
+
+class FeedbackData(BaseModel):
+    user_id: str
+    username: str
+    message: str
 
 @app.post("/feedback")
-def save_feedback(feedback: Feedback):
-    with open("feedback.txt", "a", encoding="utf-8") as f:
-        f.write(f"{feedback.user_id}: {feedback.message}\n")
-    return {"status": "saved"}
+def submit_feedback(data: FeedbackData):
+    with open(FEEDBACK_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{data.user_id} ({data.username}): {data.message}\n")
+    return {"message": "Feedback saved"}
