@@ -1,8 +1,9 @@
 fastapi
-uvicorn
-spotipy
+pydantic
 python-dotenv
+spotipy
 requests
 aiogram
 pydub
 ytmusicapi
+yt-dlp
